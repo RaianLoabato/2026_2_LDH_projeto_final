@@ -1,66 +1,42 @@
 
-
 module spi_dac_driver #(
-    parameter CLK_DIV = 25              // Divisor de clock → SPI = 1 MHz @ 50 MHz
+    parameter CLK_DIV = 25              // Divisor de clock -> SPI = 1 MHz @ 50 MHz
 )(
-    // ── Sinais de sistema ────────────────────────────────────────────────────
+    // -- Sinais de sistema ---------------------------------------------------
     input  wire        clk,             // Clock do sistema (50 MHz no DE10-Lite)
-    input  wire        rst_n,           // Reset assíncrono ativo-baixo
+    input  wire        rst_n,           // Reset assincrono ativo-baixo
 
-    // ── Interface com bloco upstream (FIR / ADC wrapper) ─────────────────────
+    // -- Interface com bloco upstream (FIR / ADC wrapper) --------------------
     input  wire [11:0] data_in,         // Amostra de 12 bits a converter
-    input  wire        start,           // Pulso de 1 ciclo: inicia transmissão
-    output reg         busy,            // '1' durante transmissão em curso
+    input  wire        start,           // Pulso de 1 ciclo: inicia transmissao
+    output reg         busy,            // '1' durante transmissao em curso
+    output reg         done,            // Pulso de 1 ciclo: transmissao concluida
 
-    // ── Pinos SPI → GPIO do DE10-Lite ────────────────────────────────────────
-    output reg         spi_clk,         // SCK  → GPIO_0[0]
-    output reg         spi_mosi,        // SDI  → GPIO_0[2]
-    output reg         spi_cs_n         // /CS  → GPIO_0[4]
+    // -- Pinos SPI -> GPIO do DE10-Lite ---------------------------------------
+    output reg         spi_clk,         // SCK  -> GPIO_0[0]
+    output reg         spi_mosi,        // SDI  -> GPIO_0[2]
+    output reg         spi_cs_n         // /CS  -> GPIO_0[4]
 );
-
-    // =========================================================================
-    // Parâmetros internos
-    // =========================================================================
 
     // Nibble de controle fixo: A/~B=0, BUF=0, ~GA=1, ~SHDN=1
     localparam [3:0] CTRL = 4'b0011;
-
-    // Número de bits no frame SPI
     localparam TOTAL_BITS = 16;
 
-    // =========================================================================
-    // Registradores internos
-    // =========================================================================
+    reg [7:0]  clk_cnt;     // Contador do divisor de clock
+    reg        spi_tick;    // Pulso de "meio periodo SPI"
+    reg [15:0] shift_reg;   // Registrador de deslocamento (16 bits do frame)
+    reg [5:0]  toggle_cnt;  // Conta togglings de SCK (0..31)
+    reg        tx_active;   // '1' enquanto a transmissao esta em curso
 
-    // Contador para divisão de clock (8 bits suporta CLK_DIV até 255)
-    reg [7:0]  clk_cnt;
-
-    // Pulso de "meio período SPI": togla spi_clk a cada ocorrência
-    reg        spi_tick;
-
-    // Registrador de deslocamento: guarda os 16 bits a enviar (MSB no topo)
-    reg [15:0] shift_reg;
-
-    // Quantos togglings de SCK já ocorreram:
-    //   - toggle ímpar  (1,3,5,...) = borda de SUBIDA  → DAC captura
-    //   - toggle par    (2,4,6,...) = borda de DESCIDA → driver coloca próximo bit
-    // Precisamos de 2×16 = 32 togglings; usamos 6 bits (0..63)
-    reg [5:0]  toggle_cnt;
-
-    // Indica transmissão em andamento
-    reg        tx_active;
-
-    // =========================================================================
-    // Divisor de clock → gera spi_tick a cada CLK_DIV ciclos de clk
-    // =========================================================================
+    // Divisor de clock -> gera spi_tick a cada CLK_DIV ciclos de clk
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             clk_cnt  <= 8'd0;
             spi_tick <= 1'b0;
         end else begin
             if (clk_cnt == CLK_DIV - 1) begin
-                clk_cnt  <= 8'd0;       // Reinicia contador
-                spi_tick <= 1'b1;       // Emite tick
+                clk_cnt  <= 8'd0;
+                spi_tick <= 1'b1;
             end else begin
                 clk_cnt  <= clk_cnt + 8'd1;
                 spi_tick <= 1'b0;
@@ -68,84 +44,61 @@ module spi_dac_driver #(
         end
     end
 
-    // =========================================================================
-    // FSM de transmissão SPI
-    //
-    // Sequência de eventos por bit (Figure 5-1):
-    //   1. /CS cai + SDI recebe MSB         (antes do toggle 1)
-    //   2. Toggle ímpar  → SCK sobe          → DAC captura SDI
-    //   3. Toggle par    → SCK desce         → driver coloca próximo bit em SDI
-    //   ... repete para os 16 bits ...
-    //   4. Após toggle 32 (descida do SCK 15) → /CS sobe → Vout atualiza
-    // =========================================================================
+    // FSM de transmissao SPI (Figure 5-1 do datasheet MCP4921)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            spi_clk   <= 1'b0;          // SCK idle LOW (CPOL=0)
-            spi_mosi  <= 1'b0;          // SDI em nível baixo
-            spi_cs_n  <= 1'b1;          // /CS desassertado
-            busy      <= 1'b0;
-            tx_active <= 1'b0;
-            shift_reg <= 16'd0;
-            toggle_cnt<= 6'd0;
-        end
+            spi_clk    <= 1'b0;      // SCK idle LOW (CPOL=0)
+            spi_mosi   <= 1'b0;
+            spi_cs_n   <= 1'b1;      // /CS desassertado
+            busy       <= 1'b0;
+            done       <= 1'b0;      // DN em repouso = 0 (sem pulso ativo)
+            tx_active  <= 1'b0;
+            shift_reg  <= 16'd0;
+            toggle_cnt <= 6'd0;
+        end else begin
+            // done eh um PULSO de 1 ciclo: volta para 0 por padrao a cada borda
+            done <= 1'b0;
 
-        // ── IDLE: aguarda start ───────────────────────────────────────────────
-        else if (!tx_active) begin
-            spi_clk  <= 1'b0;           // Mantém SCK em LOW (idle)
-            spi_cs_n <= 1'b1;           // /CS desassertado
+            // ---- IDLE: aguarda start --------------------------------------
+            if (!tx_active) begin
+                spi_clk  <= 1'b0;
+                spi_cs_n <= 1'b1;
 
-            if (start) begin
-                // Monta frame: [15:12]=CTRL, [11:0]=dado
-                shift_reg  <= {CTRL, data_in};
+                if (start) begin
+                    shift_reg  <= {CTRL, data_in};  // Monta o frame de 16 bits
+                    toggle_cnt <= 6'd0;
+                    tx_active  <= 1'b1;
+                    busy       <= 1'b1;
 
-                toggle_cnt <= 6'd0;     // Zera contador de togglings
-                tx_active  <= 1'b1;     // Entra em modo de transmissão
-                busy       <= 1'b1;
-
-                // /CS cai e SDI já recebe o MSB (bit 15) neste mesmo ciclo,
-                // conforme Figure 5-1: SDI muda junto com /CS antes do SCK 0
-                spi_cs_n  <= 1'b0;
-                spi_mosi  <= CTRL[3];   // Bit 15 do frame = MSB do nibble de controle
-                                        // CTRL[3]=0 → A/~B=0 (canal A)
+                    spi_cs_n  <= 1'b0;              // /CS cai
+                    spi_mosi  <= CTRL[3];           // Bit 15 (MSB) ja em SDI
+                end
             end
-        end
 
-        // ── ACTIVE: serializa 16 bits ─────────────────────────────────────────
-        else begin
-            if (spi_tick) begin
+            // ---- ACTIVE: serializa os 16 bits ------------------------------
+            else if (spi_tick) begin
+                toggle_cnt <= toggle_cnt + 6'd1;
 
-                toggle_cnt <= toggle_cnt + 6'd1; // Conta cada toggle de SCK
-
-                // ── Borda de SUBIDA do SCK (togglings ímpares: 1,3,5,...,31) ──
-                // O MCP4921 captura SDI nesta borda.
-                // Não mexemos em SDI aqui — o bit já estava estável desde a
-                // borda de descida anterior (ou desde /CS↓ para o bit 15).
                 if (!spi_clk) begin
-                    spi_clk <= 1'b1;    // SCK sobe → DAC captura o bit atual de SDI
-
-                // ── Borda de DESCIDA do SCK (togglings pares: 2,4,6,...,32) ──
-                // Aqui colocamos o próximo bit em SDI (setup para próxima subida).
+                    // Borda de SUBIDA -> DAC captura o bit atual de SDI
+                    spi_clk <= 1'b1;
                 end else begin
-                    spi_clk <= 1'b0;    // SCK desce
+                    // Borda de DESCIDA -> prepara proximo bit
+                    spi_clk <= 1'b0;
 
                     if (toggle_cnt == 6'd31) begin
-                        // Esse é o toggle 32 (descida após captura do bit 0 = LSB).
-                        // Frame completo enviado → finaliza transmissão.
-                        spi_cs_n  <= 1'b1;  // /CS sobe → MCP4921 converte e atualiza Vout
-                        spi_mosi  <= 1'b0;  // SDI limpo
-                        tx_active <= 1'b0;  // Volta ao IDLE
+                        // Ultimo bit enviado -> finaliza
+                        spi_cs_n  <= 1'b1;   // /CS sobe -> DAC converte
+                        spi_mosi  <= 1'b0;
+                        tx_active <= 1'b0;
                         busy      <= 1'b0;
+                        done      <= 1'b1;   // pulso DN: transmissao concluida
                     end else begin
-                        // Desloca o registrador à esquerda e apresenta o próximo bit.
-                        // toggle_cnt é par (2,4,...,30) → já enviamos (toggle_cnt/2) bits.
-                        // O próximo bit a apresentar é shift_reg[14] após o shift.
-                        shift_reg <= shift_reg << 1;        // Descarta o bit já enviado
-                        spi_mosi  <= shift_reg[14];         // Próximo MSB (após shift)
-                                                            // shift_reg[14] = bit atual [15-1]
+                        shift_reg <= shift_reg << 1;
+                        spi_mosi  <= shift_reg[14];
                     end
                 end
             end
-            // Enquanto spi_tick=0, todos os sinais permanecem estáveis
         end
     end
 
